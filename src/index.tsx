@@ -34,6 +34,8 @@ type Bindings = {
 
 const app = new Hono<{ Bindings: Bindings }>()
 
+const SOURCE_REPO_URL = 'https://github.com/gakusai-UoA/soshosai-abuse'
+
 app.use('/api/*', cors())
 
 const EMAIL_ENV_KEYS = [
@@ -169,6 +171,18 @@ app.get('/', (c) => {
       <p class="mb-6 text-sm text-gray-600">
         学園祭実行委員会での活動において、ハラスメントや規程違反に関する報告を行うための匿名フォームです。入力データはブラウザ上で暗号化されてから送信され、データベース等には一切保存されません。
       </p>
+
+      <div class="mb-6 rounded-md border border-gray-200 bg-gray-50 p-4">
+        <p class="text-sm text-gray-700">利用者が挙動を確認できるよう、このフォームの実装は公開しています。</p>
+        <a
+          href={SOURCE_REPO_URL}
+          target="_blank"
+          rel="noopener noreferrer"
+          class="mt-2 inline-block text-sm font-semibold text-blue-700 underline"
+        >
+          GitHubでソースコードを見る
+        </a>
+      </div>
 
       <form id="reportForm" class="space-y-5">
         <div>
