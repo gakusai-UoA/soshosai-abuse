@@ -7,6 +7,11 @@
 	"name": "soshosai-abuse",
 	"main": "src/index.tsx",
 	"compatibility_date": "2026-04-25",
+	"send_email": [
+		{
+			"name": "EMAIL"
+		}
+	],
 	"observability": {
 		"enabled": true
 	},
