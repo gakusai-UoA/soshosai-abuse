@@ -1,12 +1,6 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
-
-type EmailMessage = {
-  to: string
-  from: string
-  subject: string
-  text: string
-}
+import { EmailMessage } from 'cloudflare:email'
 
 type EmailBinding = {
   send: (message: EmailMessage) => Promise<void>
@@ -16,8 +10,12 @@ type EmailBinding = {
 type Bindings = {
   // 32文字(256bit)の暗号化共有キー（wrangler.toml等で設定）
   ENCRYPTION_KEY: string
+  // デプロイ時に埋め込むソースコミット
+  SOURCE_COMMIT?: string
+  // デプロイ時刻（UTC ISO8601）
+  BUILD_AT?: string
   // 送信元メールアドレス（Cloudflareで認証済みドメイン）
-  EMAIL_FROM: string
+  EMAIL_FROM?: string
   // Cloudflare Email Sending binding
   EMAIL: EmailBinding
   // 送信先メールアドレス群
@@ -35,8 +33,45 @@ type Bindings = {
 const app = new Hono<{ Bindings: Bindings }>()
 
 const SOURCE_REPO_URL = 'https://github.com/gakusai-UoA/soshosai-abuse'
+const DEFAULT_EMAIL_FROM = 'abuse-report@soshosai.com'
+
+const getProvenance = (env: Bindings) => {
+  const sourceCommit = env.SOURCE_COMMIT?.trim() || 'unknown'
+  const buildAt = env.BUILD_AT?.trim() || 'unknown'
+  const commitUrl =
+    sourceCommit !== 'unknown'
+      ? `${SOURCE_REPO_URL}/commit/${sourceCommit}`
+      : SOURCE_REPO_URL
+
+  return {
+    sourceRepository: SOURCE_REPO_URL,
+    sourceCommit,
+    commitUrl,
+    buildAt,
+    verifiable: sourceCommit !== 'unknown',
+  }
+}
 
 app.use('/api/*', cors())
+
+app.use('*', async (c, next) => {
+  await next()
+
+  const provenance = getProvenance(c.env)
+  c.res.headers.set('X-Source-Repo', provenance.sourceRepository)
+  c.res.headers.set('X-Source-Commit', provenance.sourceCommit)
+})
+
+// 利用者が稼働中のコードを照合するための公開エンドポイント
+app.get('/api/public/provenance', (c) => {
+  const provenance = getProvenance(c.env)
+  c.header('Cache-Control', 'no-store')
+
+  return c.json({
+    ...provenance,
+    checkedAt: new Date().toISOString(),
+  })
+})
 
 const EMAIL_ENV_KEYS = [
   'EMAIL_CHAIR',
@@ -59,10 +94,14 @@ app.get('/api/test/env', (c) => {
   }
 
   const encryptionKey = getString('ENCRYPTION_KEY')
-  const emailFrom = getString('EMAIL_FROM')
+  const emailFromOverride = getString('EMAIL_FROM')
+  const effectiveEmailFrom = emailFromOverride || DEFAULT_EMAIL_FROM
+  const sourceCommit = getString('SOURCE_COMMIT')
+  const buildAt = getString('BUILD_AT')
+  const sourceCommitLooksLikeSha = /^[0-9a-f]{40}$/i.test(sourceCommit)
   const encryptionKeyConfigured = encryptionKey.length > 0
-  const emailFromConfigured = emailFrom.length > 0
-  const emailFromLooksLikeEmail = emailFromConfigured && emailFrom.includes('@')
+  const emailFromConfigured = effectiveEmailFrom.length > 0
+  const emailFromLooksLikeEmail = effectiveEmailFrom.includes('@')
   const emailBindingConfigured =
     typeof (env.EMAIL as { send?: unknown } | undefined)?.send === 'function'
 
@@ -75,14 +114,26 @@ app.get('/api/test/env', (c) => {
     invalid.push('ENCRYPTION_KEY (32文字未満)')
   }
 
-  if (!emailFromConfigured) {
-    missing.push('EMAIL_FROM')
-  } else if (!emailFromLooksLikeEmail) {
+  if (emailFromOverride && !emailFromOverride.includes('@')) {
     invalid.push('EMAIL_FROM (メール形式ではない可能性)')
+  }
+
+  if (!emailFromLooksLikeEmail) {
+    invalid.push('送信元メールアドレスが不正です')
   }
 
   if (!emailBindingConfigured) {
     invalid.push('EMAIL binding (未設定またはsend関数なし)')
+  }
+
+  if (!sourceCommit) {
+    missing.push('SOURCE_COMMIT')
+  } else if (!sourceCommitLooksLikeSha) {
+    invalid.push('SOURCE_COMMIT (40桁SHA形式ではない)')
+  }
+
+  if (!buildAt) {
+    missing.push('BUILD_AT')
   }
 
   const emails = Object.fromEntries(
@@ -122,8 +173,16 @@ app.get('/api/test/env', (c) => {
         bindingConfigured: emailBindingConfigured,
         from: {
           configured: emailFromConfigured,
+          source: emailFromOverride ? 'EMAIL_FROM' : 'default',
+          value: effectiveEmailFrom,
           looksLikeEmail: emailFromLooksLikeEmail,
         },
+      },
+      provenance: {
+        sourceRepository: SOURCE_REPO_URL,
+        sourceCommit: sourceCommit || 'unknown',
+        sourceCommitLooksLikeSha,
+        buildAt: buildAt || 'unknown',
       },
       emails,
       missing,
@@ -182,6 +241,7 @@ app.get('/', (c) => {
         >
           GitHubでソースコードを見る
         </a>
+        <div id="deployedCommitInfo" class="mt-2 text-xs text-gray-600">稼働コミットを確認中...</div>
       </div>
 
       <form id="reportForm" class="space-y-5">
@@ -258,7 +318,7 @@ app.get('/', (c) => {
 
         <div>
           <label class="block font-semibold mb-1">あなたの連絡先メールアドレス（任意）</label>
-          <p class="text-xs text-gray-500 mb-1">※入力した場合、このアドレス宛に送信内容の控えが届きます。未入力の場合は完全匿名となります。</p>
+          <p class="text-xs text-gray-500 mb-1">※必要に応じて窓口担当者から連絡するために使用します。未入力の場合は完全匿名となります。</p>
           <input type="email" id="reporterEmail" class="w-full border-gray-300 rounded-md p-2 border" />
         </div>
 
@@ -285,6 +345,25 @@ app.get('/', (c) => {
             document.getElementById('otherEmail').required = false;
           }
         });
+
+        // 稼働中のコミット情報を表示（公開コードとの照合用）
+        (async () => {
+          const infoEl = document.getElementById('deployedCommitInfo');
+          if (!infoEl) return;
+
+          try {
+            const res = await fetch('/api/public/provenance');
+            const data = await res.json();
+
+            if (data?.sourceCommit && data.sourceCommit !== 'unknown') {
+              infoEl.innerHTML = '稼働コミット: <a class="underline text-blue-700" href="' + data.commitUrl + '" target="_blank" rel="noopener noreferrer">' + data.sourceCommit.slice(0, 12) + '</a>';
+            } else {
+              infoEl.textContent = '稼働コミット: 未設定（管理者に確認してください）';
+            }
+          } catch (e) {
+            infoEl.textContent = '稼働コミット情報の取得に失敗しました。';
+          }
+        })();
 
         // 共通鍵暗号化処理（AES-GCM）
         async function encryptData(text, rawKey) {
@@ -376,35 +455,35 @@ app.post('/api/report', async (c) => {
         break
       case 'vice_chair_1':
         targetEmail = c.env.EMAIL_VICE_CHAIR_1
-        destinationName = '副委員長 (1)'
+        destinationName = '副委員長 (中村)'
         break
       case 'vice_chair_2':
         targetEmail = c.env.EMAIL_VICE_CHAIR_2
-        destinationName = '副委員長 (2)'
+        destinationName = '副委員長 (竹尾)'
         break
       case 'vice_chair_3':
         targetEmail = c.env.EMAIL_VICE_CHAIR_3
-        destinationName = '副委員長 (3)'
+        destinationName = '副委員長 (山崎)'
         break
       case 'head_pr':
         targetEmail = c.env.EMAIL_HEAD_PR
-        destinationName = '広報部門長'
+        destinationName = '広報部門長 (小森)'
         break
       case 'head_response':
         targetEmail = c.env.EMAIL_HEAD_RESPONSE
-        destinationName = '対応部門長'
+        destinationName = '対応部門長 (植村)'
         break
       case 'head_plan_1':
         targetEmail = c.env.EMAIL_HEAD_PLAN_1
-        destinationName = '第一企画部門長'
+        destinationName = '第一企画部門長 (平井)'
         break
       case 'head_plan_2':
         targetEmail = c.env.EMAIL_HEAD_PLAN_2
-        destinationName = '第二企画部門長'
+        destinationName = '第二企画部門長 (杉林)'
         break
       case 'head_it':
         targetEmail = c.env.EMAIL_HEAD_IT
-        destinationName = 'IT部門長'
+        destinationName = 'IT部門長 (羽尻)'
         break
       case 'other':
         if (!otherEmail || !otherEmail.includes('@')) {
@@ -446,26 +525,6 @@ ${reporterEmail || '未入力（完全匿名での報告）'}
     // 担当者へ送信（実際のメール送信関数に置き換えてください）
     await sendEmail(c.env, targetEmail, '【重要/親展】ハラスメント・コンプライアンス報告', adminEmailText)
 
-    if (reporterEmail) {
-      const loopbackText = `
-※このメールは蒼翔祭実行委員会 コンプライアンス窓口からの自動送信控えです。
-
-以下の内容で報告を受理いたしました。
-ご指定いただいた送信先（${destinationName}）へ直接報告を転送いたしました。
-
--- 送信内容の控え --
-[送信先]: ${destinationName}
-[加害者]: ${accusedName || '未入力'}
-[ハラスメントの種類]: ${harassmentType}
-[求める対応]: ${requestedResponse}
-[事象詳細]: 
-${incidentDetails}
-------------------
-      `.trim()
-
-      await sendEmail(c.env, reporterEmail, '【蒼翔祭実行委員会】報告を受理いたしました（控え）', loopbackText)
-    }
-
     return c.json({ success: true })
   } catch (err) {
     console.error('Decryption or processing failed:', err)
@@ -473,20 +532,38 @@ ${incidentDetails}
   }
 })
 
-// ダミーのメール送信関数
-async function sendEmail(env: Bindings, to: string, subject: string, text: string) {
-  const from = env.EMAIL_FROM?.trim()
+const sanitizeHeaderValue = (value: string) => value.replace(/[\r\n]+/g, ' ').trim()
 
-  if (!from || !from.includes('@')) {
-    throw new Error('EMAIL_FROM が未設定、または不正な形式です。')
+// Cloudflare Email Sending binding を使ったメール送信関数
+async function sendEmail(env: Bindings, to: string, subject: string, text: string) {
+  const from = env.EMAIL_FROM?.trim() || DEFAULT_EMAIL_FROM
+
+  if (!from.includes('@')) {
+    throw new Error('送信元メールアドレスが不正な形式です。')
   }
 
-  await env.EMAIL.send({
-    to,
-    from,
-    subject,
+  const safeFrom = sanitizeHeaderValue(from)
+  const safeTo = sanitizeHeaderValue(to)
+  const safeSubject = sanitizeHeaderValue(subject)
+
+  if (!safeTo || !safeTo.includes('@')) {
+    throw new Error('送信先メールアドレスが不正です。')
+  }
+
+  const rawMessage = [
+    `From: ${safeFrom}`,
+    `To: ${safeTo}`,
+    `Subject: ${safeSubject}`,
+    'MIME-Version: 1.0',
+    'Content-Type: text/plain; charset=UTF-8',
+    'Content-Transfer-Encoding: 8bit',
+    '',
     text,
-  })
+  ].join('\r\n')
+
+  const message = new EmailMessage(safeFrom, safeTo, rawMessage)
+
+  await env.EMAIL.send(message)
 }
 
 export default app

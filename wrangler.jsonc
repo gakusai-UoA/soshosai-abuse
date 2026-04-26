@@ -9,9 +9,15 @@
 	"compatibility_date": "2026-04-25",
 	"send_email": [
 		{
-			"name": "EMAIL"
+			"name": "EMAIL",
+			"allowed_sender_addresses": [
+				"abuse-report@soshosai.com"
+			]
 		}
 	],
+	"vars": {
+		"EMAIL_FROM": "abuse-report@soshosai.com"
+	},
 	"observability": {
 		"enabled": true
 	},
