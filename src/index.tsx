@@ -1,6 +1,7 @@
 import { Hono } from 'hono'
-import { cors } from 'hono/cors'
+import { sValidator } from '@hono/standard-validator'
 import { EmailMessage } from 'cloudflare:email'
+import { z } from 'zod'
 
 type EmailBinding = {
   send: (message: EmailMessage) => Promise<void>
@@ -8,12 +9,12 @@ type EmailBinding = {
 
 // 環境変数の型定義
 type Bindings = {
-  // 32文字(256bit)の暗号化共有キー（wrangler.toml等で設定）
-  ENCRYPTION_KEY: string
   // デプロイ時に埋め込むソースコミット
   SOURCE_COMMIT?: string
   // デプロイ時刻（UTC ISO8601）
   BUILD_AT?: string
+  // 診断エンドポイント保護トークン（未設定時はエンドポイント無効）
+  DIAG_TOKEN?: string
   // 送信元メールアドレス（Cloudflareで認証済みドメイン）
   EMAIL_FROM?: string
   // Cloudflare Email Sending binding
@@ -52,8 +53,6 @@ const getProvenance = (env: Bindings) => {
   }
 }
 
-app.use('/api/*', cors())
-
 app.use('*', async (c, next) => {
   await next()
 
@@ -85,34 +84,102 @@ const EMAIL_ENV_KEYS = [
   'EMAIL_HEAD_IT',
 ] as const
 
-// 環境変数の設定状態を確認するテスト用エンドポイント
-app.get('/api/test/env', (c) => {
-  const env = c.env as Record<string, unknown>
+const ALLOWED_HARASSMENT_TYPES = [
+  'パワーハラスメント',
+  'セクシュアルハラスメント',
+  'モラルハラスメント',
+  '差別的言動',
+  'SNS・オンライン上の嫌がらせ',
+  'その他',
+] as const
+
+const ALLOWED_REQUESTED_RESPONSES = [
+  '相談のみ（記録のみ）',
+  '事実確認をしてほしい',
+  '相手への注意・指導をしてほしい',
+  '接触を避けるための調整をしてほしい',
+  '正式な調査をしてほしい',
+  '外部窓口へ連携してほしい',
+] as const
+
+const DESTINATION_KEYS = [
+  'chair',
+  'vice_chair_1',
+  'vice_chair_2',
+  'vice_chair_3',
+  'head_pr',
+  'head_response',
+  'head_plan_1',
+  'head_plan_2',
+  'head_it',
+] as const
+
+type DestinationKey = (typeof DESTINATION_KEYS)[number]
+
+const DESTINATION_LABELS: Record<DestinationKey, string> = {
+  chair: '委員長 (前野)',
+  vice_chair_1: '副委員長（中村）',
+  vice_chair_2: '副委員長（竹尾）',
+  vice_chair_3: '副委員長（山崎）',
+  head_pr: '広報部門長 (小森)',
+  head_response: '対応部門長 (植村)',
+  head_plan_1: '第一企画部門長 (平井)',
+  head_plan_2: '第二企画部門長 (杉林)',
+  head_it: 'IT部門長 (羽尻)',
+}
+
+const reportPayloadSchema = z.object({
+  destinationKeys: z.array(z.enum(DESTINATION_KEYS)).min(1, '送信先を1件以上選択してください。').max(9),
+  escalationDestinationKeys: z.array(z.enum(DESTINATION_KEYS)).max(9).optional().default([]),
+  harassmentType: z.enum(ALLOWED_HARASSMENT_TYPES),
+  requestedResponse: z.enum(ALLOWED_REQUESTED_RESPONSES),
+  incidentDetails: z.string().trim().min(1, '事象の詳細を入力してください。').max(4000, '事象の詳細が長すぎます。'),
+  accusedName: z.string().trim().max(200, '加害者情報は200文字以内で入力してください。').optional().default(''),
+  reporterEmail: z
+    .union([z.literal(''), z.string().trim().email('連絡先メールアドレスの形式が不正です。')])
+    .optional()
+    .default(''),
+})
+
+type RuntimeConfigCheck = {
+  ok: boolean
+  missing: string[]
+  invalid: string[]
+  emailService: {
+    bindingConfigured: boolean
+    from: {
+      configured: boolean
+      source: 'EMAIL_FROM' | 'default'
+      value: string
+      looksLikeEmail: boolean
+    }
+  }
+  provenance: {
+    sourceRepository: string
+    sourceCommit: string
+    sourceCommitLooksLikeSha: boolean
+    buildAt: string
+  }
+  emails: Record<string, { configured: boolean; looksLikeEmail: boolean }>
+}
+
+const checkRuntimeConfig = (env: Bindings): RuntimeConfigCheck => {
   const getString = (key: string) => {
-    const value = env[key]
+    const value = (env as Record<string, unknown>)[key]
     return typeof value === 'string' ? value.trim() : ''
   }
 
-  const encryptionKey = getString('ENCRYPTION_KEY')
   const emailFromOverride = getString('EMAIL_FROM')
   const effectiveEmailFrom = emailFromOverride || DEFAULT_EMAIL_FROM
   const sourceCommit = getString('SOURCE_COMMIT')
   const buildAt = getString('BUILD_AT')
   const sourceCommitLooksLikeSha = /^[0-9a-f]{40}$/i.test(sourceCommit)
-  const encryptionKeyConfigured = encryptionKey.length > 0
   const emailFromConfigured = effectiveEmailFrom.length > 0
   const emailFromLooksLikeEmail = effectiveEmailFrom.includes('@')
-  const emailBindingConfigured =
-    typeof (env.EMAIL as { send?: unknown } | undefined)?.send === 'function'
+  const emailBindingConfigured = typeof env.EMAIL?.send === 'function'
 
   const missing: string[] = []
   const invalid: string[] = []
-
-  if (!encryptionKeyConfigured) {
-    missing.push('ENCRYPTION_KEY')
-  } else if (encryptionKey.length < 32) {
-    invalid.push('ENCRYPTION_KEY (32文字未満)')
-  }
 
   if (emailFromOverride && !emailFromOverride.includes('@')) {
     invalid.push('EMAIL_FROM (メール形式ではない可能性)')
@@ -160,49 +227,59 @@ app.get('/api/test/env', (c) => {
 
   const ok = missing.length === 0 && invalid.length === 0
 
+  return {
+    ok,
+    missing,
+    invalid,
+    emailService: {
+      bindingConfigured: emailBindingConfigured,
+      from: {
+        configured: emailFromConfigured,
+        source: emailFromOverride ? 'EMAIL_FROM' : 'default',
+        value: effectiveEmailFrom,
+        looksLikeEmail: emailFromLooksLikeEmail,
+      },
+    },
+    provenance: {
+      sourceRepository: SOURCE_REPO_URL,
+      sourceCommit: sourceCommit || 'unknown',
+      sourceCommitLooksLikeSha,
+      buildAt: buildAt || 'unknown',
+    },
+    emails,
+  }
+}
+
+// 環境変数の設定状態を確認するテスト用エンドポイント
+app.get('/api/test/env', (c) => {
+  const env = c.env as Record<string, unknown>
+  const getString = (key: string) => {
+    const value = env[key]
+    return typeof value === 'string' ? value.trim() : ''
+  }
+
+  const diagToken = getString('DIAG_TOKEN')
+  const providedToken = (c.req.header('x-diag-token') || c.req.query('token') || '').trim()
+
+  if (!diagToken || providedToken !== diagToken) {
+    return c.notFound()
+  }
+  const runtimeConfig = checkRuntimeConfig(c.env)
+
   return c.json(
     {
-      ok,
+      ok: runtimeConfig.ok,
       endpoint: '/api/test/env',
-      encryptionKey: {
-        configured: encryptionKeyConfigured,
-        length: encryptionKey.length,
-        recommendedMinLength: 32,
-      },
-      emailService: {
-        bindingConfigured: emailBindingConfigured,
-        from: {
-          configured: emailFromConfigured,
-          source: emailFromOverride ? 'EMAIL_FROM' : 'default',
-          value: effectiveEmailFrom,
-          looksLikeEmail: emailFromLooksLikeEmail,
-        },
-      },
-      provenance: {
-        sourceRepository: SOURCE_REPO_URL,
-        sourceCommit: sourceCommit || 'unknown',
-        sourceCommitLooksLikeSha,
-        buildAt: buildAt || 'unknown',
-      },
-      emails,
-      missing,
-      invalid,
+      emailService: runtimeConfig.emailService,
+      provenance: runtimeConfig.provenance,
+      emails: runtimeConfig.emails,
+      missing: runtimeConfig.missing,
+      invalid: runtimeConfig.invalid,
       checkedAt: new Date().toISOString(),
     },
-    ok ? 200 : 500,
+    runtimeConfig.ok ? 200 : 500,
   )
 })
-
-// --- バックエンド：復号化ユーティリティ ---
-async function decryptData(encryptedHex: string, ivHex: string, rawKey: string) {
-  const keyBuffer = new TextEncoder().encode(rawKey.padEnd(32, '0').slice(0, 32))
-  const key = await crypto.subtle.importKey('raw', keyBuffer, { name: 'AES-GCM' }, false, ['decrypt'])
-  const encryptedBytes = new Uint8Array(encryptedHex.match(/.{1,2}/g)!.map((byte) => parseInt(byte, 16)))
-  const ivBytes = new Uint8Array(ivHex.match(/.{1,2}/g)!.map((byte) => parseInt(byte, 16)))
-
-  const decrypted = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: ivBytes }, key, encryptedBytes)
-  return new TextDecoder().decode(decrypted)
-}
 
 // --- フロントエンド：UIコンポーネント (Hono/JSX) ---
 const Layout = (props: { children: any }) => (
@@ -221,14 +298,13 @@ const Layout = (props: { children: any }) => (
 
 // トップページのルーティング（フォーム表示）
 app.get('/', (c) => {
-  // クライアント側で暗号化するためのキーを安全に渡す（実運用では公開鍵暗号方式RSA等を推奨）
-  const clientKey = c.env.ENCRYPTION_KEY || 'default_secret_key_32_chars_long!'
+  const runtimeConfig = checkRuntimeConfig(c.env)
 
   return c.html(
     <Layout>
       <h1 class="text-2xl font-bold text-red-600 mb-4">コンプライアンス相談窓口</h1>
       <p class="mb-6 text-sm text-gray-600">
-        学園祭実行委員会での活動において、ハラスメントや規程違反に関する報告を行うための匿名フォームです。入力データはブラウザ上で暗号化されてから送信され、データベース等には一切保存されません。
+        学園祭実行委員会での活動において、ハラスメントや規程違反に関する報告を行うための匿名フォームです。通信はHTTPSで保護され、データベース等には一切保存されません。
       </p>
 
       <div class="mb-6 rounded-md border border-gray-200 bg-gray-50 p-4">
@@ -244,30 +320,37 @@ app.get('/', (c) => {
         <div id="deployedCommitInfo" class="mt-2 text-xs text-gray-600">稼働コミットを確認中...</div>
       </div>
 
+      <div class={`mb-6 rounded-md border p-4 text-sm ${runtimeConfig.ok ? 'border-green-200 bg-green-50 text-green-800' : 'border-red-200 bg-red-50 text-red-800'}`}>
+        {runtimeConfig.ok
+          ? '送信システムの設定チェックに成功しました。'
+          : '現在、送信システムの設定に不備があるため受付を停止しています。時間をおいて再度お試しください。'}
+      </div>
+
       <form id="reportForm" class="space-y-5">
         <div>
           <label class="block font-semibold mb-1">送信先（必須）</label>
-          <p class="text-xs text-gray-500 mb-2">報告を直接確認する担当者を1名選択してください。他の委員に内容が漏れることはありません。</p>
-          <select id="destinationKey" required class="w-full border-gray-300 rounded-md p-2 border">
-            <option value="" disabled selected>
-              担当者を選択してください
-            </option>
-            <option value="chair">委員長 (前野)</option>
-            <option value="vice_chair_1">副委員長（中村）</option>
-            <option value="vice_chair_2">副委員長（竹尾）</option>
-            <option value="vice_chair_3">副委員長（山崎）</option>
-            <option value="head_pr">広報部門長 (小森)</option>
-            <option value="head_response">対応部門長 (植村)</option>
-            <option value="head_plan_1">第一企画部門長 (平井)</option>
-            <option value="head_plan_2">第二企画部門長 (杉林)</option>
-            <option value="head_it">IT部門長 (羽尻)</option>
-            <option value="other">その他（外部のメールアドレスを直接指定）</option>
-          </select>
+          <p class="text-xs text-gray-500 mb-2">報告を直ちに送信する担当者を1名以上選択してください。</p>
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 rounded-md border border-gray-300 p-3">
+            {DESTINATION_KEYS.map((key) => (
+              <label class="inline-flex items-center gap-2 text-sm" key={`now-${key}`}>
+                <input type="checkbox" name="destinationKeys" value={key} class="h-4 w-4" />
+                <span>{DESTINATION_LABELS[key]}</span>
+              </label>
+            ))}
+          </div>
         </div>
 
-        <div id="otherEmailWrapper" class="hidden">
-          <label class="block font-semibold mb-1">送信先メールアドレス（必須）</label>
-          <input type="email" id="otherEmail" placeholder="例: example@gmail.com" class="w-full border-gray-300 rounded-md p-2 border" />
+        <div>
+          <label class="block font-semibold mb-1">将来のエスカレーション候補（任意）</label>
+          <p class="text-xs text-gray-500 mb-2">ここで選んだ相手には現時点では送信されません。必要時の連携候補として記録されます。</p>
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 rounded-md border border-gray-300 p-3">
+            {DESTINATION_KEYS.map((key) => (
+              <label class="inline-flex items-center gap-2 text-sm" key={`esc-${key}`}>
+                <input type="checkbox" name="escalationDestinationKeys" value={key} class="h-4 w-4" />
+                <span>{DESTINATION_LABELS[key]}</span>
+              </label>
+            ))}
+          </div>
         </div>
 
         <div>
@@ -322,8 +405,8 @@ app.get('/', (c) => {
           <input type="email" id="reporterEmail" class="w-full border-gray-300 rounded-md p-2 border" />
         </div>
 
-        <button type="submit" class="w-full bg-red-600 text-white font-bold py-3 px-4 rounded hover:bg-red-700 transition">
-          暗号化して送信する
+        <button type="submit" disabled={!runtimeConfig.ok} class={`w-full text-white font-bold py-3 px-4 rounded transition ${runtimeConfig.ok ? 'bg-red-600 hover:bg-red-700' : 'bg-gray-400 cursor-not-allowed'}`}>
+          送信する
         </button>
       </form>
 
@@ -333,18 +416,7 @@ app.get('/', (c) => {
       <script
         dangerouslySetInnerHTML={{
           __html: `
-        const select = document.getElementById('destinationKey');
-        const otherEmailWrapper = document.getElementById('otherEmailWrapper');
-
-        select.addEventListener('change', (e) => {
-          if (e.target.value === 'other') {
-            otherEmailWrapper.classList.remove('hidden');
-            document.getElementById('otherEmail').required = true;
-          } else {
-            otherEmailWrapper.classList.add('hidden');
-            document.getElementById('otherEmail').required = false;
-          }
-        });
+        const canSubmit = ${runtimeConfig.ok ? 'true' : 'false'};
 
         // 稼働中のコミット情報を表示（公開コードとの照合用）
         (async () => {
@@ -365,29 +437,37 @@ app.get('/', (c) => {
           }
         })();
 
-        // 共通鍵暗号化処理（AES-GCM）
-        async function encryptData(text, rawKey) {
-          const keyBuffer = new TextEncoder().encode(rawKey.padEnd(32, '0').substring(0, 32));
-          const key = await crypto.subtle.importKey('raw', keyBuffer, { name: 'AES-GCM' }, false, ['encrypt']);
-          const iv = crypto.getRandomValues(new Uint8Array(12));
-          const encodedText = new TextEncoder().encode(text);
-          const encrypted = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, encodedText);
-
-          return {
-            encryptedHex: Array.from(new Uint8Array(encrypted)).map(b => b.toString(16).padStart(2, '0')).join(''),
-            ivHex: Array.from(iv).map(b => b.toString(16).padStart(2, '0')).join('')
-          };
+        if (!canSubmit) {
+          const statusMsg = document.getElementById('statusMessage');
+          statusMsg.classList.remove('hidden');
+          statusMsg.classList.add('text-red-600');
+          statusMsg.innerText = '現在、送信システムの設定不備により受付を停止しています。';
         }
 
         document.getElementById('reportForm').addEventListener('submit', async (e) => {
           e.preventDefault();
+          if (!canSubmit) return;
+
           const btn = e.target.querySelector('button');
           btn.disabled = true;
-          btn.innerText = '暗号化および送信中...';
+          btn.innerText = '送信中...';
+
+          const destinationKeys = Array.from(document.querySelectorAll('input[name="destinationKeys"]:checked')).map((el) => el.value);
+          const escalationDestinationKeys = Array.from(document.querySelectorAll('input[name="escalationDestinationKeys"]:checked')).map((el) => el.value);
+
+          if (destinationKeys.length === 0) {
+            const statusMsg = document.getElementById('statusMessage');
+            statusMsg.classList.remove('hidden');
+            statusMsg.classList.add('text-red-600');
+            statusMsg.innerText = '送信先を1件以上選択してください。';
+            btn.disabled = false;
+            btn.innerText = '送信する';
+            return;
+          }
 
           const payload = {
-            destinationKey: document.getElementById('destinationKey').value,
-            otherEmail: document.getElementById('otherEmail').value,
+            destinationKeys,
+            escalationDestinationKeys,
             harassmentType: document.getElementById('harassmentType').value,
             requestedResponse: document.getElementById('requestedResponse').value,
             incidentDetails: document.getElementById('incidentDetails').value,
@@ -396,14 +476,10 @@ app.get('/', (c) => {
           };
 
           try {
-            // ペイロードをJSON化して暗号化
-            const jsonString = JSON.stringify(payload);
-            const encryptedData = await encryptData(jsonString, '${clientKey}');
-
             const res = await fetch('/api/report', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(encryptedData) // 暗号化されたデータのみを送信
+              body: JSON.stringify(payload)
             });
 
             const result = await res.json();
@@ -433,78 +509,61 @@ app.get('/', (c) => {
 })
 
 // --- バックエンド：APIエンドポイント ---
-app.post('/api/report', async (c) => {
-  try {
-    const { encryptedHex, ivHex } = await c.req.json()
-
-    // 環境変数からキーを取得して復号化
-    const secretKey = c.env.ENCRYPTION_KEY || 'default_secret_key_32_chars_long!'
-    const decryptedJson = await decryptData(encryptedHex, ivHex, secretKey)
-    const body = JSON.parse(decryptedJson)
-
-    const { destinationKey, otherEmail, harassmentType, requestedResponse, incidentDetails, accusedName, reporterEmail } = body
-
-    // 宛先の決定ロジック
-    let targetEmail = ''
-    let destinationName = ''
-
-    switch (destinationKey) {
-      case 'chair':
-        targetEmail = c.env.EMAIL_CHAIR
-        destinationName = '委員長'
-        break
-      case 'vice_chair_1':
-        targetEmail = c.env.EMAIL_VICE_CHAIR_1
-        destinationName = '副委員長 (中村)'
-        break
-      case 'vice_chair_2':
-        targetEmail = c.env.EMAIL_VICE_CHAIR_2
-        destinationName = '副委員長 (竹尾)'
-        break
-      case 'vice_chair_3':
-        targetEmail = c.env.EMAIL_VICE_CHAIR_3
-        destinationName = '副委員長 (山崎)'
-        break
-      case 'head_pr':
-        targetEmail = c.env.EMAIL_HEAD_PR
-        destinationName = '広報部門長 (小森)'
-        break
-      case 'head_response':
-        targetEmail = c.env.EMAIL_HEAD_RESPONSE
-        destinationName = '対応部門長 (植村)'
-        break
-      case 'head_plan_1':
-        targetEmail = c.env.EMAIL_HEAD_PLAN_1
-        destinationName = '第一企画部門長 (平井)'
-        break
-      case 'head_plan_2':
-        targetEmail = c.env.EMAIL_HEAD_PLAN_2
-        destinationName = '第二企画部門長 (杉林)'
-        break
-      case 'head_it':
-        targetEmail = c.env.EMAIL_HEAD_IT
-        destinationName = 'IT部門長 (羽尻)'
-        break
-      case 'other':
-        if (!otherEmail || !otherEmail.includes('@')) {
-          return c.json({ error: '有効な送信先メールアドレスが指定されていません。' }, 400)
-        }
-        targetEmail = otherEmail
-        destinationName = '指定された外部アドレス'
-        break
-      default:
-        return c.json({ error: '無効な送信先が選択されました。' }, 400)
+app.post(
+  '/api/report',
+  sValidator('json', reportPayloadSchema, (result, c) => {
+    if (!result.success) {
+      const firstIssue = result.error[0]
+      return c.json({ error: firstIssue?.message || '入力内容を確認してください。' }, 400)
     }
+  }),
+  async (c) => {
+    try {
+      const {
+        destinationKeys,
+        escalationDestinationKeys,
+        harassmentType,
+        requestedResponse,
+        incidentDetails,
+        accusedName,
+        reporterEmail,
+      } = c.req.valid('json')
 
-    if (!harassmentType || !requestedResponse) {
-      return c.json({ error: 'ハラスメントの種類と求める対応を選択してください。' }, 400)
-    }
+      const destinationMap: Record<DestinationKey, { email: string; name: string }> = {
+        chair: { email: c.env.EMAIL_CHAIR, name: DESTINATION_LABELS.chair },
+        vice_chair_1: { email: c.env.EMAIL_VICE_CHAIR_1, name: DESTINATION_LABELS.vice_chair_1 },
+        vice_chair_2: { email: c.env.EMAIL_VICE_CHAIR_2, name: DESTINATION_LABELS.vice_chair_2 },
+        vice_chair_3: { email: c.env.EMAIL_VICE_CHAIR_3, name: DESTINATION_LABELS.vice_chair_3 },
+        head_pr: { email: c.env.EMAIL_HEAD_PR, name: DESTINATION_LABELS.head_pr },
+        head_response: { email: c.env.EMAIL_HEAD_RESPONSE, name: DESTINATION_LABELS.head_response },
+        head_plan_1: { email: c.env.EMAIL_HEAD_PLAN_1, name: DESTINATION_LABELS.head_plan_1 },
+        head_plan_2: { email: c.env.EMAIL_HEAD_PLAN_2, name: DESTINATION_LABELS.head_plan_2 },
+        head_it: { email: c.env.EMAIL_HEAD_IT, name: DESTINATION_LABELS.head_it },
+      }
 
-    const adminEmailText = `
+      const uniqueDestinationKeys = [...new Set(destinationKeys)] as DestinationKey[]
+      const uniqueEscalationKeys = [...new Set(escalationDestinationKeys)] as DestinationKey[]
+
+      const immediateDestinations = uniqueDestinationKeys.map((key) => ({ key, ...destinationMap[key] }))
+
+      const invalidImmediate = immediateDestinations.find((d) => !d.email || !d.email.includes('@'))
+      if (invalidImmediate) {
+        return c.json({ error: `送信先メール設定が不正です: ${invalidImmediate.name}` }, 500)
+      }
+
+      const escalationNames = uniqueEscalationKeys.map((key) => destinationMap[key].name)
+
+      const adminEmailText = `
 【コンプライアンス窓口：新規報告（親展）】
 
-本メールは指定された窓口担当者（${destinationName}）のみに送信されています。
+本メールは指定された窓口担当者にのみ送信されています。
 情報漏洩に厳重に注意し、対象者の保護を最優先に対応してください。
+
+■ 今回送信した宛先（複数）
+${immediateDestinations.map((d) => `- ${d.name}`).join('\n')}
+
+■ 将来のエスカレーション候補（今回は未送信）
+${escalationNames.length > 0 ? escalationNames.map((name) => `- ${name}`).join('\n') : '未選択'}
 
 ■ 加害者の氏名・所属（任意）
 ${accusedName || '未入力'}
@@ -522,15 +581,20 @@ ${incidentDetails}
 ${reporterEmail || '未入力（完全匿名での報告）'}
     `.trim()
 
-    // 担当者へ送信（実際のメール送信関数に置き換えてください）
-    await sendEmail(c.env, targetEmail, '【重要/親展】ハラスメント・コンプライアンス報告', adminEmailText)
+      // 今回送信対象にのみ送る（エスカレーション候補は未送信）
+      await Promise.all(
+        immediateDestinations.map((destination) =>
+          sendEmail(c.env, destination.email, '【重要/親展】ハラスメント・コンプライアンス報告', adminEmailText),
+        ),
+      )
 
-    return c.json({ success: true })
-  } catch (err) {
-    console.error('Decryption or processing failed:', err)
-    return c.json({ error: 'データの復号化または処理に失敗しました。' }, 500)
-  }
-})
+      return c.json({ success: true, sentCount: immediateDestinations.length })
+    } catch (err) {
+      console.error('Report processing failed:', err)
+      return c.json({ error: 'データの処理に失敗しました。' }, 500)
+    }
+  },
+)
 
 const sanitizeHeaderValue = (value: string) => value.replace(/[\r\n]+/g, ' ').trim()
 
